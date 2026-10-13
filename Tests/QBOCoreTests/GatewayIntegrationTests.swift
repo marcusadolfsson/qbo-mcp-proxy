@@ -439,6 +439,48 @@ final class GatewayIntegrationTests: XCTestCase {
         XCTAssertEqual(try JSON.parse(text(filtered))["total_rows"], 1)
     }
 
+    // MARK: Arguments that would be silently dropped
+
+    func testUnknownFieldsAreRefusedNotDropped() async throws {
+        // What the Accounting Agent sent: PascalCase QBO fields the tool doesn't take.
+        let (_, wrong, _) = try await post("/acme/mcp", tool(1, "update_company_info", nil, raw: ["params": [
+            "id": "1", "sync_token": "20", "sparse": true, "CompanyAddr": ["Line1": "1 Main St"],
+        ]]))
+        XCTAssertEqual(wrong?["result"]?["isError"], true)
+        XCTAssertTrue(text(wrong).contains("CompanyAddr is not a known argument"), text(wrong))
+        XCTAssertTrue(text(wrong).contains("company_addr"), "lists what is accepted")
+        let (_, none, _) = try await post("/acme/mcp", tool(2, "write_count"))
+        XCTAssertEqual(text(none), "0", "nothing sent")
+
+        let (_, right, _) = try await post("/acme/mcp", tool(3, "update_company_info", nil, raw: ["params": [
+            "id": "1", "sync_token": "20", "company_addr": ["line1": "1 Main St"],
+        ]]))
+        XCTAssertTrue(text(right).contains("Company info updated"), text(right))
+
+        // The gateway's own tools reject unknown fields too.
+        let (_, local, _) = try await post("/acme/mcp", tool(4, "get_general_ledger_compact", nil, raw: ["start": "2025-01-01"]))
+        XCTAssertTrue(text(local).contains("start is not a known argument"), text(local))
+    }
+
+    func testLedgerDatesSurviveStringifiedParams() async throws {
+        // Some clients send `params` as a JSON string; it used to fall through to the default period.
+        let (_, reply, _) = try await post("/acme/mcp", tool(1, "get_general_ledger_compact", nil, raw: [
+            "params": #"{"start_date":"2025-01-01","end_date":"2025-12-31","account":"439"}"#,
+        ]))
+        let ledger = try JSON.parse(text(reply))
+        XCTAssertEqual(ledger["period"]?["start"], "2025-01-01", text(reply))
+        XCTAssertEqual(ledger["period"]?["end"], "2025-12-31")
+        XCTAssertEqual(ledger["requested"]?["account"], "439")
+    }
+
+    func testReportsForTheWrongPeriodAreErrors() async throws {
+        let (_, pnl, _) = try await post("/acme/mcp", tool(1, "get_profit_and_loss", nil, raw: ["params": [
+            "start_date": "2025-01-01", "end_date": "2025-12-31",
+        ]]))
+        XCTAssertEqual(pnl?["result"]?["isError"], true)
+        XCTAssertTrue(text(pnl).contains("not the requested 2025-01-01 to 2025-12-31"), text(pnl))
+    }
+
     // MARK: Single instance
 
     func testSecondGatewayOnTheSameDataRefusesToStart() async throws {

@@ -115,6 +115,15 @@ public actor QBOCacheStore {
             WHERE entity_type = 'JournalEntry' AND COALESCE(total_amt, 0) = 0
               AND EXISTS (SELECT 1 FROM txn_lines l WHERE l.company = txns.company AND l.entity_type = txns.entity_type
                           AND l.txn_id = txns.id AND l.posting_type = 'Debit');
+            UPDATE txn_lines SET posting_type = CASE entity_type
+                WHEN 'Purchase' THEN CASE WHEN (SELECT t.credit FROM txns t WHERE t.company = txn_lines.company
+                    AND t.entity_type = 'Purchase' AND t.id = txn_lines.txn_id) = 1 THEN 'Credit' ELSE 'Debit' END
+                WHEN 'Bill' THEN 'Debit' WHEN 'CreditMemo' THEN 'Debit' WHEN 'RefundReceipt' THEN 'Debit'
+                WHEN 'VendorCredit' THEN 'Credit' WHEN 'Deposit' THEN 'Credit'
+                WHEN 'Invoice' THEN 'Credit' WHEN 'SalesReceipt' THEN 'Credit'
+                WHEN 'PurchaseOrder' THEN 'NonPosting' END
+            WHERE posting_type IS NULL AND entity_type IN
+                ('Purchase', 'Bill', 'CreditMemo', 'RefundReceipt', 'VendorCredit', 'Deposit', 'Invoice', 'SalesReceipt', 'PurchaseOrder');
             """)
         return db.totalChanges - before
     }
@@ -233,6 +242,21 @@ public actor QBOCacheStore {
 
     /// `qbo_cache.py`'s `_lines`, plus Transfers, which have no Line array:
     /// they become a credit to the source account and a debit to the target.
+    /// What a line does to its account, for transaction types whose lines
+    /// don't say: QuickBooks only states PostingType on journal entries.
+    /// Expense lines on a Bill or Purchase are debits (a credit-card credit,
+    /// `Credit: true`, reverses that); deposit lines credit the account they
+    /// name; purchase orders don't post at all.
+    static func impliedPosting(entity: String, _ o: JSON) -> String? {
+        switch entity {
+        case "Purchase": o["Credit"]?.boolValue == true ? "Credit" : "Debit"
+        case "Bill", "CreditMemo", "RefundReceipt": "Debit"
+        case "VendorCredit", "Deposit", "Invoice", "SalesReceipt": "Credit"
+        case "PurchaseOrder": "NonPosting"
+        default: nil
+        }
+    }
+
     static func lines(entity: String, _ o: JSON) -> [Line] {
         if entity == "Transfer" {
             let amount = number(o["Amount"])
@@ -258,6 +282,7 @@ public actor QBOCacheStore {
                 result.classID = detail["ClassRef"]?["value"]?.stringValue
                 result.departmentID = detail["DepartmentRef"]?["value"]?.stringValue
             }
+            if result.postingType == nil { result.postingType = impliedPosting(entity: entity, o) }
             return result
         }
     }

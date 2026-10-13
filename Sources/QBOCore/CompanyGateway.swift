@@ -410,7 +410,10 @@ public actor CompanyGateway {
             if let localTools, localTools.handles(name) {
                 requests += 1
                 lastRequestAt = Date()
-                return RPC.response(id: id, result: await localTools.call(name, arguments))
+                switch await checkedArguments(name, arguments, local: true) {
+                case .success(let checked): return RPC.response(id: id, result: await localTools.call(name, checked))
+                case .failure(let problem): return RPC.toolError(id: id, message: problem.description)
+                }
             }
             return await callTool(name, arguments: arguments, id: id, caller: caller, inBatch: false)
         }
@@ -431,10 +434,46 @@ public actor CompanyGateway {
             }
             return await write(name, arguments: arguments, id: id, client: caller.name, inBatch: inBatch)
         }
-        if let entity = CountQuery.entity(for: name), CountQuery.wantsCount(arguments) {
-            return await count(entity, arguments: arguments, id: id)
+        let checked: JSON
+        switch await checkedArguments(name, arguments, local: false) {
+        case .success(let value): checked = value
+        case .failure(let problem): return RPC.toolError(id: id, message: problem.description)
         }
-        return await forwardWithRetry(Self.toolCall(name, arguments, id: id), id: id)
+        if let entity = CountQuery.entity(for: name), CountQuery.wantsCount(checked) {
+            return await count(entity, arguments: checked, id: id)
+        }
+        let response = await forwardWithRetry(Self.toolCall(name, checked, id: id), id: id)
+        if let problem = ReportPeriod.mismatch(arguments: checked, response: response) {
+            return RPC.toolError(id: id, message: problem)
+        }
+        return response
+    }
+
+    // MARK: Argument checks
+
+    private func ensureCatalog() async {
+        if catalog.isEmpty { _ = await handle(["jsonrpc": "2.0", "id": 0, "method": "tools/list"]) }
+    }
+
+    struct ArgumentProblem: Error, CustomStringConvertible {
+        let description: String
+    }
+
+    /// Repairs the shapes clients send by mistake, and refuses fields the
+    /// tool would silently drop. Intuit's tools strip unknown fields without a
+    /// word, so a misnamed field (CompanyAddr for company_addr, `start` for
+    /// start_date) turns into a no-op write or a report for the wrong period.
+    func checkedArguments(_ name: String, _ arguments: JSON, local: Bool) async -> Result<JSON, ArgumentProblem> {
+        await ensureCatalog()
+        guard let schema = catalog[name]?["inputSchema"] else { return .success(arguments) }
+        let args = ToolArguments.normalize(arguments, schema: schema, unwrapParams: local)
+        let problems = local ? ToolArguments.unknownKeys(args, schema: schema).map { "\($0) is not a known argument" }
+                             : SchemaCheck.problems(args, schema: schema, strict: true)
+        guard !problems.isEmpty else { return .success(args) }
+        let accepted = ToolArguments.acceptedNames(schema)
+        return .failure(ArgumentProblem(description:
+            "\(name) was not sent: \(problems.joined(separator: "; ")). "
+            + "Accepted: \(accepted.joined(separator: ", ")). Nothing was sent to QuickBooks."))
     }
 
     static func toolCall(_ name: String, _ arguments: JSON, id: JSON) -> JSON {
@@ -458,7 +497,15 @@ public actor CompanyGateway {
         // Gateway-only options; the upstream's schemas would reject them.
         let expected = arguments["expect_company"]?.stringValue
         let key = arguments["idempotency_key"]?.stringValue
-        let upstreamArguments = arguments.setting("expect_company", to: nil).setting("idempotency_key", to: nil)
+        let stripped = arguments.setting("expect_company", to: nil).setting("idempotency_key", to: nil)
+        let upstreamArguments: JSON
+        switch await checkedArguments(name, stripped, local: false) {
+        case .success(let value): upstreamArguments = value
+        case .failure(let problem):
+            await audit?.record(.init(tool: name, ok: false, arguments: stripped, resultText: "",
+                                      error: problem.description, client: client, idempotencyKey: key, inBatch: inBatch))
+            return RPC.toolError(id: id, message: problem.description)
+        }
 
         if let expected, let problem = await companyMismatch(expected) {
             await audit?.record(.init(tool: name, ok: false, arguments: upstreamArguments, resultText: "",
@@ -709,9 +756,11 @@ public actor CompanyGateway {
         var replays: [JSON] = []
         for (index, call) in plan.calls.enumerated() {
             var found: [String] = []
-            let arguments = call.arguments.setting("expect_company", to: nil).setting("idempotency_key", to: nil)
+            var arguments = call.arguments.setting("expect_company", to: nil).setting("idempotency_key", to: nil)
             if let schema = catalog[call.name]?["inputSchema"] {
-                found += SchemaCheck.problems(arguments, schema: schema)
+                // The same check the real call gets, so a passing dry run means a sendable batch.
+                arguments = ToolArguments.normalize(arguments, schema: schema)
+                found += SchemaCheck.problems(arguments, schema: schema, strict: true)
             } else if call.name.hasPrefix(Self.internalToolPrefix) || catalog[call.name] == nil {
                 found.append("unknown tool")
             }

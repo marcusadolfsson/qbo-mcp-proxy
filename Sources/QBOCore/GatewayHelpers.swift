@@ -157,7 +157,9 @@ enum JournalBalance {
 /// required keys, unknown keys where the schema forbids them, basic types,
 /// one level into `params`.
 enum SchemaCheck {
-    static func problems(_ value: JSON, schema: JSON, path: String = "arguments") -> [String] {
+    /// `strict` treats every object as closed, whether or not the schema
+    /// says so: an unknown field is reported, never passed along to vanish.
+    static func problems(_ value: JSON, schema: JSON, path: String = "arguments", strict: Bool = false) -> [String] {
         guard schema["type"] == "object" || schema["properties"] != nil else { return typeProblem(value, schema, path) }
         guard let object = value.objectValue else { return ["\(path) should be an object"] }
         var problems: [String] = []
@@ -165,7 +167,9 @@ enum SchemaCheck {
         for key in schema["required"]?.arrayValue?.compactMap(\.stringValue) ?? [] where object[key] == nil {
             problems.append("\(path).\(key) is required")
         }
-        if schema["additionalProperties"] == .bool(false) {
+        let closed = schema["additionalProperties"] == .bool(false)
+            || (strict && schema["additionalProperties"] == nil && !properties.isEmpty)
+        if closed {
             for key in object.keys.sorted() where properties[key] == nil {
                 problems.append("\(path).\(key) is not a known argument")
             }
@@ -173,7 +177,7 @@ enum SchemaCheck {
         for (key, child) in object.sorted(by: { $0.key < $1.key }) {
             guard let childSchema = properties[key] else { continue }
             if path == "arguments" {
-                problems += Self.problems(child, schema: childSchema, path: "\(path).\(key)")
+                problems += Self.problems(child, schema: childSchema, path: "\(path).\(key)", strict: strict)
             } else {
                 problems += typeProblem(child, childSchema, "\(path).\(key)")
             }
@@ -256,5 +260,67 @@ enum ReportFlattener {
         }
         visit(report["Rows"]?["Row"]?.arrayValue ?? [], section: nil)
         return Flat(columns: columns, rows: rows, sectionTotals: totals)
+    }
+}
+
+/// Arguments as clients actually send them.
+enum ToolArguments {
+    /// - `params` sent as a JSON string (some clients stringify nested
+    ///   objects) is parsed back into an object;
+    /// - for the gateway's own tools, whose fields sit at the top level, a
+    ///   `params` wrapper is unwrapped.
+    static func normalize(_ arguments: JSON, schema: JSON, unwrapParams: Bool = false) -> JSON {
+        var args = arguments
+        if let text = args["params"]?.stringValue, let parsed = try? JSON.parse(text), parsed.objectValue != nil {
+            args = args.setting("params", to: parsed)
+        }
+        let properties = schema["properties"]?.objectValue ?? [:]
+        if unwrapParams, properties["params"] == nil, let inner = args["params"]?.objectValue, var outer = args.objectValue {
+            outer["params"] = nil
+            for (key, value) in inner where outer[key] == nil { outer[key] = value }
+            args = .object(outer)
+        }
+        return args
+    }
+
+    static func unknownKeys(_ args: JSON, schema: JSON) -> [String] {
+        let properties = schema["properties"]?.objectValue ?? [:]
+        guard !properties.isEmpty || args.objectValue?.isEmpty == false else { return [] }
+        return (args.objectValue ?? [:]).keys.sorted().filter { properties[$0] == nil }
+    }
+
+    /// The field names a caller may use: inside `params` for Intuit's tools.
+    static func acceptedNames(_ schema: JSON) -> [String] {
+        let properties = schema["properties"]?.objectValue ?? [:]
+        if let inner = properties["params"]?["properties"]?.objectValue { return inner.keys.sorted() }
+        return properties.keys.sorted()
+    }
+}
+
+/// Reports that come back for a different period than asked for.
+///
+/// QuickBooks answers a report request it can't read with its default
+/// period (usually month to date) rather than an error, and the response
+/// looks perfectly well-formed. Comparing the period in its header with the
+/// one requested turns that into an error instead of a wrong answer.
+enum ReportPeriod {
+    static func mismatch(arguments: JSON, response: JSON) -> String? {
+        let params = arguments["params"] ?? arguments
+        let start = params["start_date"]?.stringValue
+        let end = params["end_date"]?.stringValue
+        guard start != nil || end != nil, !ToolResult.isFailure(response) else { return nil }
+        let texts = response["result"]?["content"]?.arrayValue?.compactMap { $0["text"]?.stringValue } ?? []
+        guard let header = texts.lazy.compactMap({ try? JSON.parse($0) }).compactMap({ $0["Header"] }).first else { return nil }
+        let gotStart = header["StartPeriod"]?.stringValue
+        let gotEnd = header["EndPeriod"]?.stringValue
+        if let start, let gotStart, start != gotStart { return message(start, end, gotStart, gotEnd) }
+        if let end, let gotEnd, end != gotEnd { return message(start, end, gotStart, gotEnd) }
+        return nil
+    }
+
+    static func message(_ start: String?, _ end: String?, _ gotStart: String?, _ gotEnd: String?) -> String {
+        "QuickBooks returned the report for \(gotStart ?? "?") to \(gotEnd ?? "?"), not the requested "
+            + "\(start ?? "?") to \(end ?? "?"). Refusing to return a report for the wrong period; "
+            + "check the dates are YYYY-MM-DD."
     }
 }

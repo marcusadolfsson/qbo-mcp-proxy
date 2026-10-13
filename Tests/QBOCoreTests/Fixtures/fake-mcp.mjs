@@ -8,9 +8,19 @@ let throttled = 0;
 const reply = (id, result) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id, result }) + "\n");
 const text = (id, t, isError) => reply(id, { content: [{ type: "text", text: t }], ...(isError ? { isError: true } : {}) });
 
+// Most fakes take anything; these two carry real, closed schemas like
+// Intuit's, to exercise the gateway's argument checks.
+const closed = (properties, required = []) => ({ type: "object", additionalProperties: false, required: ["params"],
+  properties: { params: { type: "object", additionalProperties: false, properties, required } } });
+const schemas = {
+  update_company_info: closed({ id: { type: "string" }, sync_token: { type: "string" },
+    company_addr: { type: "object", properties: { line1: { type: "string" } } } }, ["id", "sync_token"]),
+  get_profit_and_loss: closed({ start_date: { type: "string" }, end_date: { type: "string" } }),
+};
 const tools = ["echo", "slow", "fail", "soft_fail", "crash", "authfail", "init_count", "create_journal_entry",
-  "update-bill", "write_count", "search_customers", "get_general_ledger", "__qbobar_query", "__qbobar_cdc"]
-  .map((name) => ({ name, description: `fake ${name}`, inputSchema: { type: "object" } }));
+  "update-bill", "write_count", "search_customers", "get_general_ledger", "update_company_info", "get_profit_and_loss",
+  "__qbobar_query", "__qbobar_cdc"]
+  .map((name) => ({ name, description: `fake ${name}`, inputSchema: schemas[name] ?? { type: "object" } }));
 
 createInterface({ input: process.stdin }).on("line", async (line) => {
   const msg = JSON.parse(line);
@@ -54,13 +64,20 @@ createInterface({ input: process.stdin }).on("line", async (line) => {
       return text(msg.id, `Bill updated: ${JSON.stringify({ Id: "5", SyncToken: "2" })}`);
     case "write_count":
       return text(msg.id, String(writes));
+    case "update_company_info":
+      writes++;
+      return text(msg.id, `Company info updated: ${JSON.stringify({ Id: "1", SyncToken: "21" })}`);
+    case "get_profit_and_loss":
+      // Like QuickBooks given dates it can't read: month to date, no error.
+      return reply(msg.id, { content: [{ type: "text", text: "Profit and Loss Report:" },
+        { type: "text", text: JSON.stringify({ Header: { StartPeriod: "2026-10-01", EndPeriod: "2026-10-13" }, Rows: {} }) }] });
     case "get_general_ledger": {
       const col = (title, key) => ({ ColTitle: title, MetaData: [{ Name: "ColKey", Value: key }] });
       const data = (date, type, id, num, name, memo, split, amount, balance) => ({ type: "Data", ColData: [
         { value: date }, { value: type, id }, { value: num }, { value: name }, { value: memo },
         { value: split, id: "440" }, { value: amount }, { value: balance }, { value: "No" }] });
       const report = {
-        Header: { StartPeriod: "2026-01-01", EndPeriod: "2026-09-30" },
+        Header: { StartPeriod: p.start_date ?? "2026-10-01", EndPeriod: p.end_date ?? "2026-10-13" },
         Columns: { Column: [col("Date", "tx_date"), col("Transaction Type", "txn_type"), col("Num", "doc_num"),
           col("Name", "name"), col("Memo/Description", "memo"), col("Split", "split_acc"),
           col("Amount", "subt_nat_amount"), col("Balance", "rbal_nat_amount"), col("Adj", "is_adj")] },

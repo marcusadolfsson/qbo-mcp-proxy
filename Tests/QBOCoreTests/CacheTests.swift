@@ -234,6 +234,13 @@ final class CacheSyncTests: XCTestCase {
         XCTAssertEqual(result["total"], 1)
         XCTAssertEqual(result["rows"]?.arrayValue?.first?["account_names"], ["Office Supplies"])
 
+        // Lines whose type implies their side get it, so sums need no guessing.
+        XCTAssertEqual(QBOCacheStore.lines(entity: "Purchase", FakeQBO.purchase(1, payee: "x", amount: 5, updated: "")).first?.postingType, "Debit")
+        let refund = FakeQBO.purchase(2, payee: "x", amount: 5, updated: "").setting("Credit", to: true)
+        XCTAssertEqual(QBOCacheStore.lines(entity: "Purchase", refund).first?.postingType, "Credit")
+        XCTAssertEqual(QBOCacheStore.lines(entity: "Bill", FakeQBO.purchase(3, payee: "x", amount: 5, updated: "")).first?.postingType, "Debit")
+        XCTAssertEqual(QBOCacheStore.lines(entity: "PurchaseOrder", FakeQBO.purchase(4, payee: "x", amount: 5, updated: "")).first?.postingType, "NonPosting")
+
         q = QBOCacheStore.SearchQuery()
         q.accountName = "travel"
         let value2 = try await store.search(q)["rows"]?.arrayValue?.first?["id"]

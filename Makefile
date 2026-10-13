@@ -9,10 +9,12 @@ NPM ?= npm
 # A stable signature matters here for the same reasons as in Tunnelbar —
 # Keychain ACLs (the Intuit keys and access keys) and SMAppService key on it,
 # so an ad-hoc build re-prompts for the Keychain after every rebuild.
-SIGN_IDENTITY ?= $(shell security find-identity -v -p codesigning 2>/dev/null \
-	| awk -F'"' '/Developer ID Application/ {print $$2; exit}'; \
-	security find-identity -v -p codesigning 2>/dev/null \
-	| awk -F'"' '/Apple Development/ {print $$2; exit}')
+DEVELOPER_ID := $(shell security find-identity -v -p codesigning 2>/dev/null \
+	| awk -F'"' '/Developer ID Application/ {print $$2}' | head -1)
+APPLE_DEVELOPMENT := $(shell security find-identity -v -p codesigning 2>/dev/null \
+	| awk -F'"' '/Apple Development/ {print $$2}' | head -1)
+# Exactly one identity, even when the keychain holds both kinds.
+SIGN_IDENTITY ?= $(if $(DEVELOPER_ID),$(DEVELOPER_ID),$(APPLE_DEVELOPMENT))
 CODESIGN_ID := $(if $(SIGN_IDENTITY),$(SIGN_IDENTITY),-)
 # The display name. Internals keep the QBOBar name on purpose: the bundle id
 # (Keychain access), the executable, and the data folder are what settings

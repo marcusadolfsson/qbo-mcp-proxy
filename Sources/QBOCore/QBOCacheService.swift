@@ -69,6 +69,9 @@ public enum CompanyTools {
         guard let report = texts.lazy.compactMap({ try? JSON.parse($0) }).first(where: { $0["Rows"] != nil || $0["Header"] != nil }) else {
             return QBOCacheService.error("The general ledger came back in an unexpected format.")
         }
+        if let problem = ReportPeriod.mismatch(arguments: .object(upstream), response: response) {
+            return QBOCacheService.error(problem)
+        }
         let flat = ReportFlattener.flatten(report)
         var rows = flat.rows
         if let q = args["q"]?.stringValue?.lowercased(), !q.isEmpty {
@@ -81,6 +84,9 @@ public enum CompanyTools {
         let page = Array(rows.dropFirst(offset).prefix(limit))
         return QBOCacheService.text([
             "period": ["start": report["Header"]?["StartPeriod"] ?? .null, "end": report["Header"]?["EndPeriod"] ?? .null],
+            // Exactly what was asked of QuickBooks, so a caller can see the
+            // filters it meant were the filters applied.
+            "requested": .object(upstream),
             "total_rows": .number(Double(rows.count)), "offset": .number(Double(offset)),
             "returned": .number(Double(page.count)), "has_more": .bool(offset + page.count < rows.count),
             "rows": .array(page),
@@ -594,7 +600,10 @@ public actor QBOCacheService {
             "description": """
                 Run one read-only SELECT (or WITH … SELECT) against this company's cache. Tables: txns, txn_lines, \
                 accounts, vendors, customers, items, classes, sync_state, sync_runs (txns and the lists have \
-                deleted/voided flags; raw holds the full QuickBooks JSON, usable with json_extract). Limited to \
+                deleted/voided flags; raw holds the full QuickBooks JSON, usable with json_extract). \
+                txn_lines.posting_type is Debit, Credit or NonPosting (purchase orders) for every posting line: \
+                net effect on an account is sum(CASE posting_type WHEN 'Debit' THEN amount WHEN 'Credit' THEN -amount ELSE 0 END), \
+                excluding deleted and voided txns. Limited to \
                 `limit` rows (default 200, max 1000), 5 seconds and ~200 KB; one statement, no comments.
                 """,
             "inputSchema": [
