@@ -223,9 +223,46 @@ public actor QBOCacheStore {
                 SQLValue(o["MetaData"]?["LastUpdatedTime"]?.stringValue), SQLValue(o["SyncToken"]?.stringValue),
                 .text(o.encodedString()), .int(voided ? 1 : 0), .text(stamp),
             ])
+        try insertLines(entity, id: id, o)
+    }
+
+    struct Line {
+        var number: SQLValue
+        var amount: Double?
+        var accountID, accountName, postingType, description, classID, departmentID: String?
+        /// For lines that name a product or service instead of an account:
+        /// QuickBooks posts them to the item's income or expense account.
+        var itemID: String?
+        var itemAccountKey: String?
+    }
+
+    /// Which of an item's accounts a line posts to: sales lines to its
+    /// income account, purchase lines to its expense account.
+    static let itemDetails: [(detail: String, accountKey: String)] = [
+        ("SalesItemLineDetail", "IncomeAccountRef"),
+        ("ItemBasedExpenseLineDetail", "ExpenseAccountRef"),
+    ]
+
+    /// Fills in the account of item lines from the items table. Lines whose
+    /// item isn't cached keep a nil account, which cache_status counts.
+    private func resolveItemAccounts(_ lines: [Line]) throws -> [Line] {
+        var resolved = lines
+        for index in resolved.indices where resolved[index].accountID == nil {
+            guard let item = resolved[index].itemID, let key = resolved[index].itemAccountKey else { continue }
+            let row = try db.query("""
+                SELECT json_extract(raw, '$.\(key).value') AS id, json_extract(raw, '$.\(key).name') AS name
+                FROM items WHERE company = ? AND id = ?
+                """, [.text(slug), .text(item)])
+            resolved[index].accountID = row.value("id").string
+            resolved[index].accountName = row.value("name").string
+        }
+        return resolved
+    }
+
+    private func insertLines(_ entity: String, id: String, _ o: JSON) throws {
         try db.run("DELETE FROM txn_lines WHERE company=? AND entity_type=? AND txn_id=?",
                    [.text(slug), .text(entity), .text(id)])
-        for line in Self.lines(entity: entity, o) {
+        for line in try resolveItemAccounts(Self.lines(entity: entity, o)) {
             try db.run("INSERT INTO txn_lines VALUES(?,?,?,?,?,?,?,?,?,?,?)", [
                 .text(slug), .text(entity), .text(id), line.number, SQLValue(line.amount),
                 SQLValue(line.accountID), SQLValue(line.accountName), SQLValue(line.postingType),
@@ -234,10 +271,26 @@ public actor QBOCacheStore {
         }
     }
 
-    struct Line {
-        var number: SQLValue
-        var amount: Double?
-        var accountID, accountName, postingType, description, classID, departmentID: String?
+    /// Re-derives the lines of transactions that have item or discount lines
+    /// without an account: files written before item lines were resolved.
+    /// Runs on open; touches nothing once every resolvable line has an account.
+    func relinkItemLines() throws -> Int {
+        let rows = try db.query("""
+            SELECT DISTINCT t.entity_type, t.id, t.raw FROM txns t
+            JOIN txn_lines l ON l.company = t.company AND l.entity_type = t.entity_type AND l.txn_id = t.id
+            WHERE t.company = ? AND l.account_id IS NULL AND t.raw IS NOT NULL
+              AND (t.raw LIKE '%SalesItemLineDetail%' OR t.raw LIKE '%ItemBasedExpenseLineDetail%'
+                   OR t.raw LIKE '%DiscountLineDetail%')
+            """, [.text(slug)])
+        guard !rows.rows.isEmpty else { return 0 }
+        try db.transaction {
+            for index in rows.rows.indices {
+                guard let entity = rows[index, "entity_type"].string, let id = rows[index, "id"].string,
+                      let raw = rows[index, "raw"].string, let object = try? JSON.parse(raw) else { continue }
+                try insertLines(entity, id: id, object)
+            }
+        }
+        return rows.rows.count
     }
 
     /// `qbo_cache.py`'s `_lines`, plus Transfers, which have no Line array:
@@ -281,6 +334,30 @@ public actor QBOCacheStore {
                 result.postingType = detail["PostingType"]?.stringValue
                 result.classID = detail["ClassRef"]?["value"]?.stringValue
                 result.departmentID = detail["DepartmentRef"]?["value"]?.stringValue
+            }
+            // Item lines name a product or service; the account comes from
+            // the item (resolved against the items table on insert).
+            if result.accountID == nil {
+                for (key, accountKey) in itemDetails {
+                    guard let detail = line[key] else { continue }
+                    if let account = detail["AccountRef"] {
+                        result.accountID = account["value"]?.stringValue
+                        result.accountName = account["name"]?.stringValue
+                    } else {
+                        result.itemID = detail["ItemRef"]?["value"]?.stringValue
+                        result.itemAccountKey = accountKey
+                    }
+                    result.classID = result.classID ?? detail["ClassRef"]?["value"]?.stringValue
+                    break
+                }
+            }
+            // A discount reduces income: it debits its discount account.
+            if result.accountID == nil, let discount = line["DiscountLineDetail"] {
+                result.accountID = discount["DiscountAccountRef"]?["value"]?.stringValue
+                result.accountName = discount["DiscountAccountRef"]?["name"]?.stringValue
+                if discount["DiscountAccountRef"] != nil {
+                    result.postingType = entity == "Invoice" || entity == "SalesReceipt" ? "Debit" : "Credit"
+                }
             }
             if result.postingType == nil { result.postingType = impliedPosting(entity: entity, o) }
             return result
@@ -420,7 +497,21 @@ public actor QBOCacheStore {
                 "last_success_at": state.value("last_success_at").json,
                 "last_error": state.value("last_error").json,
             ]
-            if case .transaction = kind { entry["voided_rows"] = .number(Double(counts.value("voided").int ?? 0)) }
+            if case .transaction = kind {
+                entry["voided_rows"] = .number(Double(counts.value("voided").int ?? 0))
+                // Posting lines the cache couldn't tie to an account: they're
+                // in no account's totals, so a count here means account sums
+                // are incomplete even though the cache is fresh.
+                let unlinked = try db.query("""
+                    SELECT count(*) AS n FROM txn_lines l JOIN txns t
+                      ON t.company = l.company AND t.entity_type = l.entity_type AND t.id = l.txn_id
+                    WHERE l.company = ? AND l.entity_type = ? AND l.account_id IS NULL
+                      AND COALESCE(l.amount, 0) != 0 AND COALESCE(l.posting_type, '') != 'NonPosting'
+                      AND t.deleted = 0 AND t.voided = 0
+                      AND l.entity_type NOT IN ('Payment', 'BillPayment')
+                    """, [.text(slug), .text(name)]).value("n").int ?? 0
+                entry["lines_without_account"] = .number(Double(unlinked))
+            }
             entities.append(.object(entry))
         }
         let lastRun = try db.query("SELECT * FROM sync_runs ORDER BY id DESC LIMIT 1")

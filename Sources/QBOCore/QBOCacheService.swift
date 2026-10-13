@@ -192,10 +192,14 @@ public actor QBOCacheService {
     // MARK: Companies
 
     /// Opens (or creates) a company's cache and remembers how to fetch for it.
-    public func attach(slug: String, fetcher: QBOFetcher) throws {
+    public func attach(slug: String, fetcher: QBOFetcher) async throws {
         if stores[slug] == nil {
             let store = try QBOCacheStore(slug: slug, path: databasePath(slug))
             stores[slug] = store
+            // Files from before item lines were resolved get their accounts now.
+            if let relinked = try? await store.relinkItemLines(), relinked > 0 {
+                log.write("[\(slug)] [cache] resolved accounts on \(relinked) transactions' item lines")
+            }
         }
         fetchers[slug] = fetcher
         Task { await refreshSummary(slug) }
@@ -214,7 +218,7 @@ public actor QBOCacheService {
         for suffix in ["", "-wal", "-shm"] {
             try? FileManager.default.removeItem(atPath: databasePath(slug) + suffix)
         }
-        try attach(slug: slug, fetcher: fetcher)
+        try await attach(slug: slug, fetcher: fetcher)
         log.write("[\(slug)] [cache] rebuilding from scratch")
         await sync(slug: slug)
     }

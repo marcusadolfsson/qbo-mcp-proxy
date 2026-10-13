@@ -279,6 +279,47 @@ final class CacheSyncTests: XCTestCase {
         XCTAssertEqual(value4, 4)
     }
 
+    /// The aced-aviation case: a monthly sublease invoiced through an item
+    /// whose income account is the hangar expense account.
+    func testItemLinesPostToTheItemsAccount() async throws {
+        let fake = FakeQBO()
+        let now = ISO8601DateFormatter().string(from: Date())
+        fake.objects["Item"] = [["Id": "9", "Name": "Hangar sublease", "Type": "Service", "Active": true,
+                                 "IncomeAccountRef": ["value": "100", "name": "N329MC:N329MC Hangar"],
+                                 "MetaData": ["LastUpdatedTime": .string(now)]]]
+        fake.objects["Invoice"] = [[
+            "Id": "5478", "TxnDate": "2025-03-01", "DocNumber": "5008", "TotalAmt": .number(2386.63),
+            "CustomerRef": ["value": "4", "name": "Tenant"], "MetaData": ["LastUpdatedTime": .string(now)],
+            "Line": [
+                ["Id": "1", "Amount": .number(2386.63), "DetailType": "SalesItemLineDetail",
+                 "SalesItemLineDetail": ["ItemRef": ["value": "9", "name": "Hangar sublease"]]],
+                ["Amount": .number(2386.63), "DetailType": "SubTotalLineDetail", "SubTotalLineDetail": [:]],
+                ["Id": "2", "Amount": 5, "DetailType": "SalesItemLineDetail",
+                 "SalesItemLineDetail": ["ItemRef": ["value": "77", "name": "Not cached"]]],
+            ],
+        ]]
+        _ = await QBOCacheSync.run(store: store, fetcher: fake, log: log)
+
+        var q = QBOCacheStore.SearchQuery()
+        q.accountID = "100"
+        let found = try await store.search(q)
+        XCTAssertEqual(found["rows"]?.arrayValue?.first?["id"], "5478", "the invoice counts toward account 100")
+        let status = try await store.status(needsAuth: false)
+        let invoice = status["entities"]?.arrayValue?.first { $0["entity_type"] == "Invoice" }
+        XCTAssertEqual(invoice?["lines_without_account"], 1, "the line whose item isn't cached is reported, not hidden")
+
+        // A file written before item lines were resolved is repaired on open.
+        let path = store.path
+        store = nil
+        let db = try SQLiteDatabase(path: path)
+        try db.execute("UPDATE txn_lines SET account_id = NULL, account_name = NULL WHERE txn_id = '5478'")
+        let reopened = try QBOCacheStore(slug: "acme", path: path)
+        let relinked = try await reopened.relinkItemLines()
+        XCTAssertEqual(relinked, 1)
+        let again = try await reopened.search(q)
+        XCTAssertEqual(again["total"], 1)
+    }
+
     func testEntityFailuresAndOrderByFallback() async throws {
         let fake = FakeQBO()
         fake.failing = ["PurchaseOrder"]
