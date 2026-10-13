@@ -32,7 +32,10 @@ DMG := dist/QBO-MCP-Proxy.dmg
 # Universal: Apple Silicon and Intel. The bundled server is plain JavaScript,
 # so only the Swift binary needs both architectures.
 ARCHS := --arch arm64 --arch x86_64
-RELEASE_BIN := .build/apple/Products/Release/QBOBar
+# Asked of SwiftPM, not assumed: its output folder depends on the build
+# backend (.build/apple/… or .build/out/…), and a hard-coded path once kept
+# copying a stale binary while reporting success.
+RELEASE_BIN = $(shell $(SWIFT) build -c release $(ARCHS) --show-bin-path)/QBOBar
 NODE ?= node
 INSTALL_DIR ?= /Applications
 
@@ -100,9 +103,10 @@ serve: server ## Run the gateway headlessly from SwiftPM (uses the real Keychain
 .PHONY: app
 app: server ## Assemble and sign the app, with Intuit's server bundled
 	$(SWIFT) build -c release $(ARCHS)
+	@test "$(RELEASE_BIN)" -nt Package.swift || { echo "Release binary $(RELEASE_BIN) is missing or stale"; exit 1; }
 	rm -rf "$(APP)"
 	mkdir -p "$(APP)/Contents/MacOS" "$(APP)/Contents/Resources"
-	cp $(RELEASE_BIN) "$(APP)/Contents/MacOS/$(EXE_NAME)"
+	cp "$(RELEASE_BIN)" "$(APP)/Contents/MacOS/$(EXE_NAME)"
 	@lipo -info "$(APP)/Contents/MacOS/$(EXE_NAME)"
 	cp Resources/Info.plist "$(APP)/Contents/Info.plist"
 	cp -R $(SERVER_STAGE) "$(APP)/Contents/Resources/server"

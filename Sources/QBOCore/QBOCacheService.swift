@@ -607,7 +607,10 @@ public actor QBOCacheService {
                 deleted/voided flags; raw holds the full QuickBooks JSON, usable with json_extract). \
                 txn_lines.posting_type is Debit, Credit or NonPosting (purchase orders) for every posting line: \
                 net effect on an account is sum(CASE posting_type WHEN 'Debit' THEN amount WHEN 'Credit' THEN -amount ELSE 0 END), \
-                excluding deleted and voided txns. Limited to \
+                excluding deleted and voided txns. Item lines (invoices, sales receipts, item-based purchases) take \
+                their item's current income/expense account, not the account as of the transaction: when reconciling \
+                a closed year, spot-check against a live report. Check cache_status lines_without_account is 0 \
+                before trusting an account total. Limited to \
                 `limit` rows (default 200, max 1000), 5 seconds and ~200 KB; one statement, no comments.
                 """,
             "inputSchema": [
